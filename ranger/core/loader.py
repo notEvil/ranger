@@ -48,93 +48,129 @@ class Loadable(object):
         pass
 
 
-class CopyLoader(Loadable, FileManagerAware):  # pylint: disable=too-many-instance-attributes
+class CopyLoaderBase(Loadable, FileManagerAware):
     progressbar_supported = True
 
-    def __init__(self, copy_buffer, do_cut=False, overwrite=False):
-        self.copy_buffer = tuple(copy_buffer)
+    def __init__(self, pairs, do_cut=False, overwrite=False,
+                 beforeCutCallbacks=None, beforeEachCutCallbacks=None, afterCallbacks=None):
+        if beforeCutCallbacks is None:
+            beforeCutCallbacks = []
+        if beforeEachCutCallbacks is None:
+            beforeEachCutCallbacks = [self._beforeEachCut]
+        if afterCallbacks is None:
+            afterCallbacks = []
+        self.pairs = pairs
         self.do_cut = do_cut
-        self.original_copy_buffer = copy_buffer
-        self.original_path = self.fm.thistab.path
         self.overwrite = overwrite
         self.percent = 0
-        if self.copy_buffer:
-            self.one_file = self.copy_buffer[0]
+        self.beforeCutCallbacks = beforeCutCallbacks
+        self.beforeEachCutCallbacks = beforeEachCutCallbacks
+        self.afterCallbacks = afterCallbacks
         Loadable.__init__(self, self.generate(), 'Calculating size...')
 
-    def _calculate_size(self, step):
-        from os.path import join
+    def _calculate_size(self, pairs, step):
+        ospath = os.path
         size = 0
-        stack = [fobj.path for fobj in self.copy_buffer]
+        # step_size = 0
+        stack = [source.path for source, _ in pairs]
         while stack:
             fname = stack.pop()
-            if os.path.islink(fname):
+            if ospath.islink(fname):
                 continue
-            if os.path.isdir(fname):
-                stack.extend([join(fname, item) for item in os.listdir(fname)])
+            if ospath.isdir(fname):
+                stack.extend([ospath.join(fname, item) for item in os.listdir(fname)])
             else:
                 try:
                     fstat = os.stat(fname)
                 except OSError:
                     continue
-                size += max(step, math.ceil(fstat.st_size / step) * step)
+                size += fstat.st_size
+                # step_size += max(step, math.ceil(fstat.st_size / step) * step)
         return size
 
     def generate(self):
-        if not self.copy_buffer:
+        if len(self.pairs) == 0:
             return
 
         from ranger.ext import shutil_generatorized as shutil_g
+        from ranger.ext.human_readable import human_readable
+        ospath = os.path
+
         # TODO: Don't calculate size when renaming (needs detection)
-        bytes_per_tick = shutil_g.BLOCK_SIZE
-        size = max(1, self._calculate_size(bytes_per_tick))
-        size_str = " (" + human_readable(self._calculate_size(1)) + ")"
+        size = self._calculate_size(self.pairs, shutil_g.BLOCK_SIZE)
+        commonpath = ospath.commonpath([target for _, target in self.pairs])
+
         done = 0
         if self.do_cut:
-            self.original_copy_buffer.clear()
-            if len(self.copy_buffer) == 1:
-                self.description = "moving: " + self.one_file.path + size_str
-            else:
-                self.description = "moving files from: " + self.one_file.dirname + size_str
-            for fobj in self.copy_buffer:
-                for path in self.fm.tags.tags:
-                    if path == fobj.path or str(path).startswith(fobj.path):
-                        tag = self.fm.tags.tags[path]
-                        self.fm.tags.remove(path)
-                        self.fm.tags.tags[
-                            path.replace(fobj.path, self.original_path + '/' + fobj.basename)
-                        ] = tag
-                        self.fm.tags.dump()
+            for callback in self.beforeCutCallbacks:
+                callback(self)
+
+            self.description = 'moving files to {} ({})'.format(commonpath, human_readable(size))
+
+            for source, target in self.pairs:
+                for callback in self.beforeEachCutCallbacks:
+                    callback(self, source, target)
+
                 n = 0
-                for n in shutil_g.move(src=fobj.path, dst=self.original_path,
-                                       overwrite=self.overwrite):
+                for n in shutil_g.move(src=source.path, dst=target, overwrite=self.overwrite):
                     self.percent = ((done + n) / size) * 100.
                     yield
                 done += n
-        else:
-            if len(self.copy_buffer) == 1:
-                self.description = "copying: " + self.one_file.path + size_str
-            else:
-                self.description = "copying files from: " + self.one_file.dirname + size_str
-            for fobj in self.copy_buffer:
-                if os.path.isdir(fobj.path) and not os.path.islink(fobj.path):
+
+        else:  # copy
+            self.description = 'copying files to {} ({})'.format(commonpath, human_readable(size))
+
+            for source, target in self.pairs:
+                if ospath.isdir(source.path) and not ospath.islink(source.path):
                     n = 0
-                    for n in shutil_g.copytree(
-                            src=fobj.path,
-                            dst=os.path.join(self.original_path, fobj.basename),
-                            symlinks=True,
-                            overwrite=self.overwrite,
-                    ):
+                    for n in shutil_g.copytree(src=source.path, dst=target, symlinks=True, overwrite=self.overwrite):
                         self.percent = ((done + n) / size) * 100.
                         yield
                     done += n
+
                 else:
                     n = 0
-                    for n in shutil_g.copy2(fobj.path, self.original_path,
-                                            symlinks=True, overwrite=self.overwrite):
+                    for n in shutil_g.copy2(source.path, target, symlinks=True, overwrite=self.overwrite):
                         self.percent = ((done + n) / size) * 100.
                         yield
                     done += n
+
+        for callback in self.afterCallbacks:
+            callback(self)
+
+    def _beforeEachCut(self, _, fobj, target):
+        for path in self.fm.tags.tags:
+            if path == fobj.path or str(path).startswith(fobj.path):
+                tag = self.fm.tags.tags[path]
+                self.fm.tags.remove(path)
+                self.fm.tags.tags[
+                    path.replace(fobj.path, target)
+                ] = tag
+                self.fm.tags.dump()
+
+
+class CopyLoader(CopyLoaderBase):
+    def __init__(self, copy_buffer, do_cut=False, overwrite=False):
+        ospath = os.path
+
+        self.copy_buffer = tuple(copy_buffer)
+        # self.do_cut = do_cut
+        self.original_copy_buffer = copy_buffer
+        self.original_path = self.fm.thistab.path
+        # self.overwrite = overwrite
+        self.percent = 0
+        if self.copy_buffer:
+            self.one_file = self.copy_buffer[0]
+        # Loadable.__init__(self, self.generate(), 'Calculating size...')
+
+        pairs = [(fobj, ospath.join(self.original_path, fobj.basename)) for fobj in self.copy_buffer]
+        super().__init__(pairs, do_cut=do_cut, overwrite=overwrite, beforeCutCallbacks=[self._beforeCut],
+                         afterCallbacks=[self._afterCallback])
+
+    def _beforeCut(self, _):
+        self.original_copy_buffer.clear()
+
+    def _afterCallback(self, _):
         cwd = self.fm.get_directory(self.original_path)
         cwd.load_content()
 
